@@ -198,7 +198,8 @@ if __name__ == '__main__':
         for i in range(len(subject_mean)):
             result_dct['s' + str(i)] = subject_mean[i]
 
-        dct = dct.append(result_dct, ignore_index=True)
+        new_row = pd.DataFrame([result_dct])
+        dct = pd.concat([dct, new_row], ignore_index=True)
 
     # save results to csv
     dct.to_csv('./logs/' + str(args.method) + ".csv")

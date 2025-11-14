@@ -15,7 +15,7 @@ from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_combine_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb, cal_score_online
 from utils.alg_utils import EA, EA_online
-from utils.sr_utils import apply_bistable_sr
+from utils.sr_utils import apply_bistable_sr_torch
 from scipy.linalg import fractional_matrix_power
 from utils.loss import Entropy
 from sklearn.metrics import roc_auc_score, accuracy_score
@@ -49,7 +49,11 @@ def TTIME(loader, model, args, balanced=True):
 
     iter_test = iter(loader)
     
+    # 预计算 MSR 时间步长
     msr_dt = 1.0 / args.sample_rate
+    # 确定我们的目标设备 (从模型参数中获取, e.g., 'cuda:0')
+    device = next(model.parameters()).device
+    
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
@@ -62,40 +66,48 @@ def TTIME(loader, model, args, balanced=True):
         # ================ 在 TTIME 循环中应用 SR ================
         # (在 EA 和模型预测之前)
         # ==========================================================
-        # 将数据转为 numpy
-        inputs_numpy = inputs_raw.cpu().numpy()
+# ==========================================================
+        # ================ 修正：调用 PyTorch MSR ===================
+        # ==========================================================
         
-        # 应用您的 SR 函数
-        inputs_sr_numpy = apply_bistable_sr(
-            inputs_numpy, 
+        # 1. 挤压(Squeeze)掉多余的维度：(1, 1, 22, 1001) -> (1, 22, 1001)
+        inputs_3d = inputs_raw.squeeze(1) # inputs_3d.shape 是 (1, 22, 1001)
+
+        # 2. !! 将数据推送到 GPU !!
+        inputs_3d_gpu = inputs_3d.to(device)
+        
+        # 3. 在 GPU 上应用您的 SR 函数
+        inputs_sr_gpu = apply_bistable_sr_torch(
+            inputs_3d_gpu, # 传入 (1, 22, 1001) 形状的 GPU 张量
             dt=msr_dt, 
-            noise_intensity=args.msr_noise_intensity, # 从 args 获取
-            a=args.msr_a, # 从 args 获取
-            b=args.msr_b  # 从 args 获取
+            noise_intensity=args.msr_noise_intensity,
+            a=args.msr_a, 
+            b=args.msr_b  
         )
         
-        # 转回 tensor 供后续使用
-        inputs = torch.from_numpy(inputs_sr_numpy).float()
-        # ==========================================================
+        # 4. 将维度加回去：(1, 22, 1001) -> (1, 1, 22, 1001)
+        # 结果 (inputs) 仍然在 GPU 上
+        inputs = inputs_sr_gpu.unsqueeze(1)#==========================================================
         # ======================= SR 结束 ==========================
         # ==========================================================
         
-        inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).cpu()
 
         # accumulate test data
         if i == 0:
-            data_cum = inputs.float().cpu()
+            data_cum = inputs.float()
         else:
-            data_cum = torch.cat((data_cum, inputs.float().cpu()), 0)
+            data_cum = torch.cat((data_cum, inputs.float()), 0)
 
         # Incremental EA
         if args.align:
             start_time = time.time()
 
             if i == 0:
-                sample_test = data_cum.reshape(args.chn, args.time_sample_num)
+                sample_test_gpu = data_cum.reshape(args.chn, args.time_sample_num)
             else:
-                sample_test = data_cum[i].reshape(args.chn, args.time_sample_num)
+                sample_test_gpu = data_cum[i].reshape(args.chn, args.time_sample_num)
+            # --- 在 CPU 上运行 IEA (这仍然是瓶颈) ---
+            sample_test = sample_test_gpu.cpu()
             # update reference matrix
             R = EA_online(sample_test, R, i)
 
@@ -107,14 +119,17 @@ def TTIME(loader, model, args, balanced=True):
             if args.calc_time:
                 print('sample ', str(i), ', pre-inference IEA finished time in ms:', np.round((EA_time - start_time) * 1000, 3))
             sample_test = sample_test.reshape(1, 1, args.chn, args.time_sample_num)
+            
+            sample_test = torch.from_numpy(sample_test).to(torch.float32).to(device)
         else:
-            sample_test = data_cum[i].numpy()
-            sample_test = sample_test.reshape(1, 1, sample_test.shape[1], sample_test.shape[2])
+            # (如果不用 EA, 我们的数据 'inputs' 已经在 GPU 上了)
+            sample_test = inputs # (inputs 已经是 (1,1,C,T) 且在 GPU 上)
+            # (不再需要 .numpy() 和 .cuda() 了)
 
-        if args.data_env != 'local':
-            sample_test = torch.from_numpy(sample_test).to(torch.float32).cuda()
-        else:
-            sample_test = torch.from_numpy(sample_test).to(torch.float32)
+        # if args.data_env != 'local':
+        #     sample_test = torch.from_numpy(sample_test).to(torch.float32).cuda()
+        # else:
+        #     sample_test = torch.from_numpy(sample_test).to(torch.float32)
 
         _, outputs = model(sample_test)
 
@@ -132,13 +147,15 @@ def TTIME(loader, model, args, balanced=True):
         # sliding batch
         if (i + 1) >= args.test_batch and (i + 1) % args.stride == 0:
             if args.align:
-                batch_test = np.copy(data_cum[i - args.test_batch + 1:i + 1])
+                # --- 在 CPU 上运行 TTA 批次的 IEA (仍然是瓶颈) ---
+                batch_test = np.copy(data_cum[i - args.test_batch + 1:i + 1].cpu().numpy())
                 # transform test batch
                 batch_test = np.dot(sqrtRefEA, batch_test)
                 batch_test = np.transpose(batch_test, (1, 2, 0, 3))
             else:
-                batch_test = data_cum[i - args.test_batch + 1:i + 1].numpy()
-                batch_test = batch_test.reshape(args.test_batch, 1, batch_test.shape[2], batch_test.shape[3])
+                # (如果不用 EA, data_cum 已经在 GPU 上)
+                batch_test = data_cum[i - args.test_batch + 1:i + 1]
+                # batch_test = batch_test.reshape(args.test_batch, 1, batch_test.shape[2], batch_test.shape[3])
 
             if args.data_env != 'local':
                 batch_test = torch.from_numpy(batch_test).to(torch.float32).cuda()
@@ -479,7 +496,8 @@ if __name__ == '__main__':
         for i in range(len(subject_mean)):
             result_dct['s' + str(i)] = subject_mean[i]
 
-        dct = dct.append(result_dct, ignore_index=True)
+        new_row = pd.DataFrame([result_dct])
+        dct = pd.concat([dct, new_row], ignore_index=True)    
 
     # save results to csv
     dct.to_csv('./logs/' + str(args.method) + ".csv")

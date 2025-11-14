@@ -130,6 +130,12 @@ dmypy.json
 
 .idea
 backup/
+data/
+runs/
+/runs
+/data
+easy_demo/
+logs/
 multi_source.py
 dnn_multi_source.py
 domain_classifier.py
@@ -139,3 +145,6 @@ maml.py
 aug_utils.py
 test.py
 feature_ssda.py
+.DS__Store
+.DS_Store
+*.ckpt
