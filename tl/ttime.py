@@ -15,6 +15,7 @@ from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_combine_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb, cal_score_online
 from utils.alg_utils import EA, EA_online
+from utils.sr_utils import apply_bistable_sr
 from scipy.linalg import fractional_matrix_power
 from utils.loss import Entropy
 from sklearn.metrics import roc_auc_score, accuracy_score
@@ -47,14 +48,38 @@ def TTIME(loader, model, args, balanced=True):
         c = 4
 
     iter_test = iter(loader)
-
+    
+    msr_dt = 1.0 / args.sample_rate
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
         model.eval()
         data = next(iter_test)
-        inputs = data[0]
+        inputs_raw = data[0]
         labels = data[1]
+        
+        # ==========================================================
+        # ================ 在 TTIME 循环中应用 SR ================
+        # (在 EA 和模型预测之前)
+        # ==========================================================
+        # 将数据转为 numpy
+        inputs_numpy = inputs_raw.cpu().numpy()
+        
+        # 应用您的 SR 函数
+        inputs_sr_numpy = apply_bistable_sr(
+            inputs_numpy, 
+            dt=msr_dt, 
+            noise_intensity=args.msr_noise_intensity, # 从 args 获取
+            a=args.msr_a, # 从 args 获取
+            b=args.msr_b  # 从 args 获取
+        )
+        
+        # 转回 tensor 供后续使用
+        inputs = torch.from_numpy(inputs_sr_numpy).float()
+        # ==========================================================
+        # ======================= SR 结束 ==========================
+        # ==========================================================
+        
         inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).cpu()
 
         # accumulate test data
@@ -124,7 +149,7 @@ def TTIME(loader, model, args, balanced=True):
             for step in range(args.steps):
 
                 _, outputs = model(batch_test)
-                outputs = outputs.float().cpu()
+                outputs = outputs.float()
 
                 args.epsilon = 1e-5
                 softmax_out = nn.Softmax(dim=1)(outputs / args.t)
@@ -362,11 +387,19 @@ if __name__ == '__main__':
 
         # whether to record running time
         calc_time = False
+        
+        # MSR参数
+        msr_noise_intensity = 0.1  # !! 关键调优参数 !!
+        msr_a = 1.0
+        msr_b = 1.0
 
         args = argparse.Namespace(feature_deep_dim=feature_deep_dim, align=align, lr=lr, t=t, max_epoch=max_epoch,
                                   trial_num=trial_num, time_sample_num=time_sample_num, sample_rate=sample_rate,
                                   N=N, chn=chn, class_num=class_num, stride=stride, steps=steps, calc_time=calc_time,
-                                  paradigm=paradigm, test_batch=test_batch, data_name=data_name, balanced=balanced)
+                                  paradigm=paradigm, test_batch=test_batch, data_name=data_name, balanced=balanced,
+                                  msr_noise_intensity=msr_noise_intensity,
+                                  msr_a=msr_a,
+                                  msr_b=msr_b)
 
         args.method = 'T-TIME'
         args.backbone = 'EEGNet'
