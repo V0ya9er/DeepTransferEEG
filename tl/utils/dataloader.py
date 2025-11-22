@@ -3,8 +3,10 @@
 # @Author  : Siyang Li
 # @File    : dataloader.py
 import numpy as np
+import torch
 from sklearn import preprocessing
 from utils.data_utils import traintest_split_cross_subject, traintest_split_domain_classifier, traintest_split_multisource, traintest_split_domain_classifier_pretest, traintest_split_multisource
+from .alg_utils import EA,EA_torch, matrix_power_torch
 
 
 def data_process(dataset):

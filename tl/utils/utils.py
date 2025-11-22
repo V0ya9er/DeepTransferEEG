@@ -18,7 +18,7 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, roc_auc_sco
 from scipy.linalg import fractional_matrix_power
 from learn2learn.data.transforms import NWays, KShots, LoadData
 
-from utils.alg_utils import EA, EA_online
+from utils.alg_utils import *
 
 from moabb.datasets import BNCI2014001, BNCI2014002, BNCI2014008, BNCI2014009, BNCI2015003, BNCI2015004, EPFLP300, \
     BNCI2014004, BNCI2015001
@@ -117,13 +117,11 @@ def fix_random_seed(SEED):
 
 
 def create_folder(dir_name, data_env, win_root):
-    if not osp.exists(dir_name):
-        os.system('mkdir -p ' + dir_name)
-    if not osp.exists(dir_name):
-        if data_env == 'gpu':
-            os.mkdir(dir_name)
-        elif data_env == 'local':
-            os.makedirs(win_root + dir_name)
+    try:
+        # exist_ok=True 表示如果文件夹已存在则不报错，模拟 mkdir -p
+        os.makedirs(dir_name, exist_ok=True)
+    except Exception as e:
+        print(f"创建文件夹失败 {dir_name}: {e}")
 
 
 def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
@@ -392,42 +390,83 @@ def cal_metrics_multisource(loader, nets, args, metrics):
 
 def data_alignment(X, num_subjects, args):
     '''
-    :param X: np array, EEG data
+    :param X: np array, EEG data (TotalTrials, Channels, Time)
     :param num_subjects: int, number of total subjects in X
     :return: np array, aligned EEG data
     '''
-    # subject-wise EA
-    if args.data == 'BNCI2015003' and len(
-            X) < 141:  # check is dataset BNCI2015003 and is downsampled and is not testset
-        # upsampling for unequal distributions across subjects, i.e., each subject is upsampled to different num of trials
-        print('before EA:', X.shape)
-        out = []
+    print('before EA:', X.shape)
+    
+    # 检查是否可以使用 GPU
+    device = torch.device("cuda" if args.data_env != 'local' else "cpu")
+    use_gpu = (device.type == 'cuda')
+    
+    if use_gpu:
+        print("Executing EA on GPU...")
+    
+    out = []
+    
+    # 处理 BNCI2015003 的特殊逻辑 (保持原样，只在内部替换 EA 调用)
+    if args.data == 'BNCI2015003' and len(X) < 141:
         inds = [140, 140, 140, 140, 640, 840, 840, 840, 840, 840]
         inds = np.delete(inds, args.idt)
+        indices_cumulative = np.cumsum(inds)
+        start_idx = 0
         for i in range(num_subjects):
-            tmp_x = EA(X[np.sum(inds[:i]):np.sum(inds[:i + 1]), :, :])
+            end_idx = indices_cumulative[i]
+            subject_data = X[start_idx:end_idx, :, :]
+            
+            if use_gpu:
+                # 转为 GPU 张量 -> EA -> 转回 CPU numpy
+                sub_tensor = torch.from_numpy(subject_data).float().to(device)
+                aligned_tensor = EA_subject_gpu(sub_tensor)
+                tmp_x = aligned_tensor.cpu().numpy()
+            else:
+                tmp_x = EA(subject_data)
+                
             out.append(tmp_x)
-        X = np.concatenate(out, axis=0)
-        print('after EA:', X.shape)
-    elif args.data == 'BNCI2015003' and len(X) > 25200:  # check is dataset BNCI2015003 and is upsampled
-        # upsampling for unequal distributions across subjects, i.e., each subject is upsampled to different num of trials
-        print('before EA:', X.shape)
-        out = []
+            start_idx = end_idx
+
+    elif args.data == 'BNCI2015003' and len(X) > 25200:
         inds = [4900, 4900, 4900, 4900, 4400, 4200, 4200, 4200, 4200, 4200]
         inds = np.delete(inds, args.idt)
+        indices_cumulative = np.cumsum(inds)
+        start_idx = 0
         for i in range(num_subjects):
-            tmp_x = EA(X[np.sum(inds[:i]):np.sum(inds[:i + 1]), :, :])
+            end_idx = indices_cumulative[i]
+            subject_data = X[start_idx:end_idx, :, :]
+            
+            if use_gpu:
+                sub_tensor = torch.from_numpy(subject_data).float().to(device)
+                aligned_tensor = EA_subject_gpu(sub_tensor)
+                tmp_x = aligned_tensor.cpu().numpy()
+            else:
+                tmp_x = EA(subject_data)
+                
             out.append(tmp_x)
-        X = np.concatenate(out, axis=0)
-        print('after EA:', X.shape)
+            start_idx = end_idx
+            
     else:
-        print('before EA:', X.shape)
-        out = []
+        # 标准数据集处理逻辑
+        # 假设每个被试的数据量相等
+        trials_per_sub = X.shape[0] // num_subjects
+        
         for i in range(num_subjects):
-            tmp_x = EA(X[X.shape[0] // num_subjects * i:X.shape[0] // num_subjects * (i + 1), :, :])
+            subject_data = X[trials_per_sub * i : trials_per_sub * (i + 1), :, :]
+            
+            if use_gpu:
+                # 1. 传输到 GPU
+                sub_tensor = torch.from_numpy(subject_data).float().to(device)
+                # 2. GPU 计算
+                aligned_tensor = EA_subject_gpu(sub_tensor)
+                # 3. 传回 CPU (因为后续流程仍基于numpy)
+                tmp_x = aligned_tensor.cpu().numpy()
+            else:
+                tmp_x = EA(subject_data)
+                
             out.append(tmp_x)
-        X = np.concatenate(out, axis=0)
-        print('after EA:', X.shape)
+
+    X = np.concatenate(out, axis=0)
+    print('after EA:', X.shape)
     return X
 
 

@@ -211,3 +211,4 @@ def apply_msr_to_channel(signal_1d, a, b, D, dt):
         x_out[i+1] = x_out[i] + drift + noise
         
     return x_out
+  

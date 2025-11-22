@@ -14,7 +14,7 @@ from utils.network import backbone_net
 from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_combine_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb, cal_score_online
-from utils.alg_utils import EA, EA_online
+from utils.alg_utils import *
 from utils.sr_utils import apply_bistable_sr_torch
 from scipy.linalg import fractional_matrix_power
 from utils.loss import Entropy
@@ -41,7 +41,7 @@ def TTIME(loader, model, args, balanced=True):
 
     # initialize test reference matrix for Incremental EA
     if args.align:
-        R = 0
+        R_tensor = None # 我们将 R 初始化为 None
 
     if not balanced:
         zk_arrs = np.zeros(2)
@@ -92,7 +92,7 @@ def TTIME(loader, model, args, balanced=True):
         # ==========================================================
         
 
-        # accumulate test data
+        # 5. 在 GPU 上累积
         if i == 0:
             data_cum = inputs.float()
         else:
@@ -106,21 +106,23 @@ def TTIME(loader, model, args, balanced=True):
                 sample_test_gpu = data_cum.reshape(args.chn, args.time_sample_num)
             else:
                 sample_test_gpu = data_cum[i].reshape(args.chn, args.time_sample_num)
-            # --- 在 CPU 上运行 IEA (这仍然是瓶颈) ---
-            sample_test = sample_test_gpu.cpu()
-            # update reference matrix
-            R = EA_online(sample_test, R, i)
-
-            sqrtRefEA = fractional_matrix_power(R, -0.5)
-            # transform current test sample
-            sample_test = np.dot(sqrtRefEA, sample_test)
+                
+            # 1. 在 GPU 上运行 EA_online_torch
+            R_tensor = EA_online_torch(sample_test_gpu, R_tensor, i)
+            
+            # 2. 在 GPU 上运行 matrix_power_torch
+            sqrtRefEA_torch = matrix_power_torch(R_tensor, -0.5)
+            
+            # 3. 在 GPU 上运行矩阵乘法
+            sample_test_aligned_gpu = torch.matmul(sqrtRefEA_torch, sample_test_gpu)
 
             EA_time = time.time()
             if args.calc_time:
                 print('sample ', str(i), ', pre-inference IEA finished time in ms:', np.round((EA_time - start_time) * 1000, 3))
             sample_test = sample_test.reshape(1, 1, args.chn, args.time_sample_num)
             
-            sample_test = torch.from_numpy(sample_test).to(torch.float32).to(device)
+            # 4. 恢复形状 (仍在 GPU 上)
+            sample_test = sample_test_aligned_gpu.reshape(1, 1, args.chn, args.time_sample_num)
         else:
             # (如果不用 EA, 我们的数据 'inputs' 已经在 GPU 上了)
             sample_test = inputs # (inputs 已经是 (1,1,C,T) 且在 GPU 上)
@@ -131,41 +133,54 @@ def TTIME(loader, model, args, balanced=True):
         # else:
         #     sample_test = torch.from_numpy(sample_test).to(torch.float32)
 
-        _, outputs = model(sample_test)
+        # !! sample_test 和 model 都在 GPU 上
+        _, outputs = model(sample_test.to(torch.float32))
 
         softmax_out = nn.Softmax(dim=1)(outputs)
 
-        outputs = outputs.float().cpu()
-        labels = labels.float().cpu()
-        _, predict = torch.max(outputs, 1)
-
+        # (!! Phase 1 的评估部分仍然需要 .cpu() 来存储结果 !!)
+        outputs_cpu = outputs.float().cpu()
+        labels_cpu = labels.float().cpu()
+        _, predict = torch.max(outputs_cpu, 1)
         y_pred.append(softmax_out.detach().cpu().numpy())
-        y_true.append(labels.item())
+        y_true.append(labels_cpu.item())
 
         #################### Phase 2: target model update ####################
         model.train()
         # sliding batch
         if (i + 1) >= args.test_batch and (i + 1) % args.stride == 0:
             if args.align:
-                # --- 在 CPU 上运行 TTA 批次的 IEA (仍然是瓶颈) ---
-                batch_test = np.copy(data_cum[i - args.test_batch + 1:i + 1].cpu().numpy())
-                # transform test batch
-                batch_test = np.dot(sqrtRefEA, batch_test)
-                batch_test = np.transpose(batch_test, (1, 2, 0, 3))
+                # !! TTA 批处理 (!! 现在完全在 GPU 上 !!)
+                
+                # 1. 从 GPU 上的 data_cum 获取批次
+                batch_gpu = data_cum[i - args.test_batch + 1:i + 1] # (B, 1, C, T)
+                
+                # 2. 准备批次进行矩阵乘法
+                batch_squeezed = batch_gpu.squeeze(1) # (B, C, T)
+                
+                # 3. 准备对齐矩阵 (C, C) -> (B, C, C)
+                sqrtRefEA_batch = sqrtRefEA_torch.unsqueeze(0).expand(batch_squeezed.shape[0], -1, -1) 
+                
+                # 4. 在 GPU 上对齐批次
+                aligned_batch = torch.matmul(sqrtRefEA_batch, batch_squeezed) # (B, C, T)
+                
+                # 5. 恢复形状 (仍在 GPU 上)
+                batch_test = aligned_batch.unsqueeze(1)
             else:
                 # (如果不用 EA, data_cum 已经在 GPU 上)
                 batch_test = data_cum[i - args.test_batch + 1:i + 1]
                 # batch_test = batch_test.reshape(args.test_batch, 1, batch_test.shape[2], batch_test.shape[3])
 
-            if args.data_env != 'local':
-                batch_test = torch.from_numpy(batch_test).to(torch.float32).cuda()
-            else:
-                batch_test = torch.from_numpy(batch_test).to(torch.float32)
+            # if args.data_env != 'local':
+            #     batch_test = torch.from_numpy(batch_test).to(torch.float32).cuda()
+            # else:
+            #     batch_test = torch.from_numpy(batch_test).to(torch.float32)
 
             start_time = time.time()
             for step in range(args.steps):
 
-                _, outputs = model(batch_test)
+                # (!! 整个 TTA 更新循环现在都在 GPU 上 !!)
+                _, outputs = model(batch_test.to(torch.float32)) # GPU
                 outputs = outputs.float()
 
                 args.epsilon = 1e-5
