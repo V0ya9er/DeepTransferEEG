@@ -13,10 +13,10 @@ import torch.utils.data
 import torch.utils.data as Data
 import moabb
 import mne
-import learn2learn as l2l
+# import learn2learn as l2l
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, roc_auc_score
 from scipy.linalg import fractional_matrix_power
-from learn2learn.data.transforms import NWays, KShots, LoadData
+# from learn2learn.data.transforms import NWays, KShots, LoadData
 
 from utils.alg_utils import *
 
@@ -220,38 +220,46 @@ def cal_auc(loader, netF, netC):
 
 
 def cal_acc_comb(loader, model, flag=True, fc=None, args=None):
-    start_test = True
     model.eval()
+    correct_count = 0
+    total_count = 0
+    
     with tr.no_grad():
-        iter_test = iter(loader)
-        for i in range(len(loader)):
-            data = next(iter_test)
-            inputs = data[0]
-            labels = data[1]
+        # 直接遍历 loader，比原来的 next(iter(...)) 更安全且高效
+        for inputs, labels in loader:
+            
+            # 1. 确保数据在 GPU 上
             if args.data_env != 'local':
                 inputs = inputs.cuda()
-            inputs = inputs
+                labels = labels.cuda() # 标签也要在 GPU 上以便直接比较
+            
+            # 2. 模型推理 (纯 GPU 操作)
             if flag:
                 _, outputs = model(inputs)
             else:
                 if fc is not None:
-                    outputs, _ = model(inputs)  # modified
+                    outputs, _ = model(inputs)
                 else:
                     outputs = model(inputs)
-            if start_test:
-                all_output = outputs.float().cpu()
-                all_label = labels.float()
-                start_test = False
-            else:
-                all_output = tr.cat((all_output, outputs.float().cpu()), 0)
-                all_label = tr.cat((all_label, labels.float()), 0)
-    all_output = nn.Softmax(dim=1)(all_output)
-    _, predict = tr.max(all_output, 1)
-    pred = tr.squeeze(predict).float()
-    true = all_label.cpu()
-    acc = accuracy_score(true, pred)
 
-    return acc * 100, all_output
+            # 3. 计算预测结果 (纯 GPU 操作)
+            # 不需要 Softmax，直接看谁最大即可，结果是一样的
+            _, predict = tr.max(outputs, 1)
+            
+            # 4. 统计正确数 (纯 GPU 操作)
+            # 只有最后的 .item() 会把一个标量数字传回 CPU，开销极小
+            correct_count += (predict == labels).sum().item()
+            total_count += labels.size(0)
+
+    # 5. 计算最终准确率
+    if total_count == 0:
+        acc = 0
+    else:
+        acc = correct_count / total_count * 100
+
+    # 返回 acc 和 None。
+    # 原代码返回了 all_output，但在 dnn.py 中并未被使用，所以传 None 是安全的且能节省显存。
+    return acc, None
 
 
 def convert_label(labels, axis, threshold):

@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+torch.backends.cudnn.benchmark = True
 import pandas as pd
 
 from utils.network import backbone_net
@@ -120,7 +121,7 @@ if __name__ == '__main__':
         args.lr = 0.001
 
         # train batch size
-        args.batch_size = 32
+        args.batch_size = 256
 
         # training epochs
         args.max_epoch = 100

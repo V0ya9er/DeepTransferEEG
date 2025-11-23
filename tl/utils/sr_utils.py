@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import torch
+import math
 
 def apply_bistable_sr(signal_data, dt, noise_intensity, a=1.0, b=1.0):
     """
@@ -57,8 +58,14 @@ def apply_bistable_sr(signal_data, dt, noise_intensity, a=1.0, b=1.0):
     return output_signal.reshape(original_shape)
   
   
-@torch.no_grad() # <-- 关键优化：告诉PyTorch不要跟踪此函数的梯度
-def apply_bistable_sr_torch(signal_data_tensor, dt, noise_intensity, a=1.0, b=1.0):
+@torch.jit.script
+def apply_bistable_sr_torch(
+    signal_data_tensor: torch.Tensor,  # <--- 显式标注为 Tensor
+    dt: float,                         # <--- 显式标注为 float
+    noise_intensity: float,            # <--- 显式标注为 float
+    a: float = 1.0,                    # <--- 显式标注为 float，解决默认值冲突
+    b: float = 1.0                     # <--- 显式标注为 float
+) -> torch.Tensor:                     # <--- (可选) 标注返回类型
     """
     应用经典双稳态随机共振模型。(PyTorch GPU 版本)
 
@@ -94,35 +101,36 @@ def apply_bistable_sr_torch(signal_data_tensor, dt, noise_intensity, a=1.0, b=1.
     num_channels, num_samples = signal_data_2d.shape
     
     # 1. 归一化输入信号 (PyTorch)
-    signal_mean = torch.mean(signal_data_2d, dim=1, keepdim=True)
-    signal_std = torch.std(signal_data_2d, dim=1, keepdim=True)
-    # 避免除以零
-    normalized_signal = (signal_data_2d - signal_mean) / (signal_std + 1e-9)
+    signal_mean = torch.mean(signal_data_tensor, dim=1, keepdim=True)
+    signal_std = torch.std(signal_data_tensor, dim=1, keepdim=True)
+    normalized_signal = (signal_data_tensor - signal_mean) / (signal_std + 1e-9)
     
     # 2. 初始化 (PyTorch), 确保在新张量上指定 device 和 dtype
-    output_signal = torch.zeros_like(normalized_signal, device=device, dtype=dtype)
-    x = torch.zeros(num_channels, device=device, dtype=dtype)  # 每个通道的初始状态 x(t=0)
+    output_signal = torch.zeros_like(normalized_signal)
+    x = torch.zeros(signal_data_tensor.shape[0], device=signal_data_tensor.device, dtype=signal_data_tensor.dtype)  # 每个通道的初始状态 x(t=0)
     
     # 3. 预计算噪声缩放因子 (PyTorch)
     # 将标量值转换为 tensor，以便在 GPU 上进行后续计算
-    noise_scale = torch.tensor(np.sqrt(2 * noise_intensity * dt), device=device, dtype=dtype)
+    noise_scale = math.sqrt(2 * noise_intensity * dt)
     
     # Euler-Maruyama 积分
-    for t in range(num_samples):
-        # dx = (a*x - b*x^3 + S(t)) * dt + sqrt(2*D*dt) * W(t)
+    for t in range(signal_data_tensor.shape[1]):
         
-        # 确定性力 (PyTorch)
+        # 确定性力
         deterministic_force = (a * x - b * torch.pow(x, 3)) + normalized_signal[:, t]
         
-        # 随机力 (PyTorch), 使用 torch.randn 在 GPU 上生成噪声
-        stochastic_force = torch.randn(num_channels, device=device, dtype=dtype) * noise_scale
+        # 随机力
+        # noise_scale 是 float，直接乘即可
+        stochastic_force = torch.randn_like(x) * noise_scale
         
         # 更新状态
         x = x + deterministic_force * dt + stochastic_force
         output_signal[:, t] = x
         
-    # 4. 将输出重塑为原始形状
-    return output_signal.reshape(original_shape)  
+    return output_signal.reshape(signal_data_tensor.shape)
+  
+# apply_bistable_sr_opt = torch.compile(apply_bistable_sr_torch)
+# Linux上才能能用这一行
   
 def apply_bistable_sr_batch(signal_data, dt, noise_intensity, a=1.0, b=1.0):
     """
