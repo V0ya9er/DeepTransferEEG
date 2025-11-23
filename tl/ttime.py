@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+torch.backends.cudnn.benchmark = True
 import pandas as pd
 import csv
 from utils.network import backbone_net
@@ -54,6 +55,16 @@ def TTIME(loader, model, args, balanced=True):
     # 确定我们的目标设备 (从模型参数中获取, e.g., 'cuda:0')
     device = next(model.parameters()).device
     
+    # 在循环开始前预分配内存
+    # 假设 inputs_shape 是 (1, C, T)
+    total_samples = len(loader)
+    # 预分配一个全零的大张量在 GPU 上
+    data_cum = torch.zeros((total_samples, 1, args.chn, args.time_sample_num), 
+                           device=device, dtype=torch.float32)
+    
+    # 维护一个计数器
+    current_idx = 0
+    
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
@@ -76,57 +87,91 @@ def TTIME(loader, model, args, balanced=True):
         # 2. !! 将数据推送到 GPU !!
         inputs_3d_gpu = inputs_3d.to(device)
         
-        # 3. 在 GPU 上应用您的 SR 函数
-        inputs_sr_gpu = apply_bistable_sr_torch(
-            inputs_3d_gpu, # 传入 (1, 22, 1001) 形状的 GPU 张量
-            dt=msr_dt, 
-            noise_intensity=args.msr_noise_intensity,
-            a=args.msr_a, 
-            b=args.msr_b  
-        )
+        # === 新增：信号衰减系数 (Input Scaling) ===
+        # 将信号幅度缩小到原本的 1/10，使其变成“弱信号”
+        # 这样势垒 (0.25) 对它来说就很高了，必须要噪声帮忙
+        scaling_factor = 1.0  
+        inputs_scaled_gpu = inputs_3d_gpu * scaling_factor
         
-        # 4. 将维度加回去：(1, 22, 1001) -> (1, 1, 22, 1001)
-        # 结果 (inputs) 仍然在 GPU 上
-        inputs = inputs_sr_gpu.unsqueeze(1)#==========================================================
+        if args.msr_noise_intensity > 0:
+            # 生成与信号形状相同的噪声
+            # 噪声强度直接由 msr_noise_intensity 控制
+            # 这里不需要 dt，直接控制噪声的幅度标准差
+            noise = torch.randn_like(inputs_scaled_gpu) * args.msr_noise_intensity
+            
+            inputs_sr_gpu = inputs_scaled_gpu + noise
+        else:
+            # D=0 时，直接原样输出
+            inputs_sr_gpu = inputs_scaled_gpu
+            
+        #==========================================================
         # ======================= SR 结束 ==========================
         # ==========================================================
-        
+        # if i == 0: # 为了不刷屏，我们只画第一个试次(Trial)的图
+        #     import matplotlib.pyplot as plt
+        #     import os
+            
+        #     # 获取第一个通道的数据 (转回 CPU 以便绘图)
+        #     # 对比：缩放后的原始信号 vs MSR处理后的信号
+        #     orig_wave = inputs_scaled_gpu[0, 0, :].detach().cpu().numpy()
+        #     sr_wave = inputs_sr_gpu[0, 0, :].detach().cpu().numpy()
+            
+        #     plt.figure(figsize=(12, 8))
+            
+        #     # 子图1: 原始信号 (缩放后)
+        #     plt.subplot(2, 1, 1)
+        #     plt.plot(orig_wave, color='blue', alpha=0.7)
+        #     plt.title(f"Original Input (Scaled by {scaling_factor})")
+        #     plt.grid(True, alpha=0.3)
+            
+        #     # 子图2: MSR 输出信号
+        #     plt.subplot(2, 1, 2)
+        #     plt.plot(sr_wave, color='red', alpha=0.7)
+        #     plt.title(f"MSR Output (D={args.msr_noise_intensity}, a={args.msr_a}, b={args.msr_b})")
+        #     plt.grid(True, alpha=0.3)
+            
+        #     plt.tight_layout()
+            
+        #     # 保存图片到 logs 文件夹
+        #     save_path = f'./logs/signal_check_D{args.msr_noise_intensity}_a{args.msr_a}.png'
+        #     plt.savefig(save_path)
+        #     print(f"\n[Diagnostic] Signal plot saved to: {save_path}")
+        #     print("[Diagnostic] Please check this image to see if the signal is destroyed!")
+            
+            # (可选) 如果您想看完图就停止程序，可以取消下面这行的注释
+            # sys.exit(0) 
+        # =======================================================
+        inputs = inputs_sr_gpu.unsqueeze(1)
 
         # 5. 在 GPU 上累积
-        if i == 0:
-            data_cum = inputs.float()
-        else:
-            data_cum = torch.cat((data_cum, inputs.float()), 0)
+        # 直接填入对应位置，不进行 cat 操作
+        data_cum[i] = inputs # inputs 已经在 GPU 上
+
 
         # Incremental EA
         if args.align:
             start_time = time.time()
-
-            if i == 0:
-                sample_test_gpu = data_cum.reshape(args.chn, args.time_sample_num)
-            else:
-                sample_test_gpu = data_cum[i].reshape(args.chn, args.time_sample_num)
-                
-            # 1. 在 GPU 上运行 EA_online_torch
-            R_tensor = EA_online_torch(sample_test_gpu, R_tensor, i)
             
-            # 2. 在 GPU 上运行 matrix_power_torch
+            # 1. 从 GPU 上的 data_cum 获取数据
+            sample_test_gpu = data_cum[i].reshape(args.chn, args.time_sample_num)
+            
+            # 2. EA 计算 (GPU)
+            R_tensor = EA_online_torch(sample_test_gpu, R_tensor, i)
             sqrtRefEA_torch = matrix_power_torch(R_tensor, -0.5)
             
-            # 3. 在 GPU 上运行矩阵乘法
+            # 3. 矩阵乘法 (GPU)
+            # 结果保存在 sample_test_aligned_gpu 中
             sample_test_aligned_gpu = torch.matmul(sqrtRefEA_torch, sample_test_gpu)
 
             EA_time = time.time()
             if args.calc_time:
                 print('sample ', str(i), ', pre-inference IEA finished time in ms:', np.round((EA_time - start_time) * 1000, 3))
-            sample_test = sample_test.reshape(1, 1, args.chn, args.time_sample_num)
             
-            # 4. 恢复形状 (仍在 GPU 上)
+            # 4. 恢复形状 (这里需要使用 sample_test_aligned_gpu)
             sample_test = sample_test_aligned_gpu.reshape(1, 1, args.chn, args.time_sample_num)
+            
         else:
-            # (如果不用 EA, 我们的数据 'inputs' 已经在 GPU 上了)
-            sample_test = inputs # (inputs 已经是 (1,1,C,T) 且在 GPU 上)
-            # (不再需要 .numpy() 和 .cuda() 了)
+            sample_test = inputs
 
         # if args.data_env != 'local':
         #     sample_test = torch.from_numpy(sample_test).to(torch.float32).cuda()
@@ -361,7 +406,11 @@ def train_target(args):
         args.SEED) + extra_string + '_adapted' + '.ckpt')
 
     # save the predictions for ensemble
-    with open('./logs/' + str(args.data_name) + '_' + str(args.method) + '_seed_' + str(args.SEED) +"_pred.csv", 'a') as f:
+    # 修正：将 MSR 参数加入文件名，防止覆盖
+    file_suffix = f"_D{args.msr_noise_intensity}_a{args.msr_a}_pred.csv"
+    save_path = './logs/' + str(args.data_name) + '_' + str(args.method) + '_seed_' + str(args.SEED) + file_suffix
+    
+    with open(save_path, 'a') as f:
         writer = csv.writer(f)
         writer.writerow(y_pred)
 
@@ -372,147 +421,91 @@ def train_target(args):
     return acc_t_te
 
 
+
+
+
 if __name__ == '__main__':
-
+    import time
+    
+    # ================= 实验配置区域 =================
+    # 1. 定义要跑的数据集
     data_name_list = ['BNCI2014001', 'BNCI2014002', 'BNCI2015001', 'BNCI2014001-4']
+    
+    # 2. 定义对比实验组 (根据您之前的最佳实践)
+    # Group 1: 基准 (No SR)
+    # Group 2: 增强 (Additive Noise, D=0.5)
+    experiment_configs = [
+        {'D': 0.0, 'a': 0.0, 'b': 0.0, 'desc': 'Baseline'}, 
+        {'D': 0.5, 'a': 0.0, 'b': 0.0, 'desc': 'SR_Noise'},
+    ]
+    
+    # 3. 运行所有种子
+    seed_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    # ==============================================
 
-    dct = pd.DataFrame(columns=['dataset', 'avg', 'std', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12', 's13'])
+    total_start_time = time.time()
 
-    for data_name in data_name_list:
-        # N: number of subjects, chn: number of channels
-        if data_name == 'BNCI2014001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
-        if data_name == 'BNCI2014002': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
-        if data_name == 'BNCI2015001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
-        if data_name == 'BNCI2014001-4': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 4, 1001, 250, 288, 248
+    for config in experiment_configs:
+        cur_D, cur_a, cur_b = config['D'], config['a'], config['b']
+        print(f"\n\n{'#'*40}")
+        print(f"### Starting Experiment Group: {config['desc']} (D={cur_D})")
+        print(f"{'#'*40}")
 
-        # whether to use pretrained model
-        # if source models have not been trained, set use_pretrained_model to False to train them
-        # alternatively, run dnn.py to train source models, in seperating the steps
-        use_pretrained_model = True
-        if use_pretrained_model:
-            # no training
-            max_epoch = 0
-        else:
-            # training epochs
-            max_epoch = 100
+        for data_name in data_name_list:
+            # === 数据集参数配置 (保持原逻辑) ===
+            if data_name == 'BNCI2014001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
+            if data_name == 'BNCI2014002': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
+            if data_name == 'BNCI2015001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
+            if data_name == 'BNCI2014001-4': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 4, 1001, 250, 288, 248
 
-        # learning rate
-        lr = 0.001
+            # 固定参数
+            args = argparse.Namespace(feature_deep_dim=feature_deep_dim, align=True, lr=0.001, t=2, max_epoch=0,
+                                      trial_num=trial_num, time_sample_num=time_sample_num, sample_rate=sample_rate,
+                                      N=N, chn=chn, class_num=class_num, stride=1, steps=1, calc_time=False,
+                                      paradigm=paradigm, test_batch=8, data_name=data_name, balanced=True,
+                                      data=data_name, # 修复属性缺失
+                                      
+                                      # 动态 MSR 参数
+                                      msr_noise_intensity=cur_D, msr_a=cur_a, msr_b=cur_b)
 
-        # test batch size
-        test_batch = 8
+            args.method = 'T-TIME'
+            args.backbone = 'EEGNet'
+            args.batch_size = 32
 
-        # update step
-        steps = 1
+            try:
+                device_id = str(sys.argv[1])
+                os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+                args.data_env = 'gpu' if torch.cuda.device_count() != 0 else 'local'
+            except:
+                args.data_env = 'local'
+            
+            print(f"\n>>> Dataset: {data_name} | Config: D={cur_D}")
 
-        # update stride
-        stride = 1
+            for s in seed_list: 
+                args.SEED = s
+                fix_random_seed(args.SEED)
+                torch.backends.cudnn.deterministic = True
+                
+                # 日志设置
+                args.local_dir = './data/' + str(data_name) + '/'
+                args.result_dir = './logs/'
+                # 这里的日志文件主要用于调试，不需要太关注，重点是生成的 csv
+                my_log = LogRecord(args) 
+                my_log.log_init() # 可以注释掉以减少垃圾文件，或者保留
 
-        # whether to use EA
-        align = True
+                sub_acc_all = np.zeros(N)
+                for idt in range(N):
+                    args.idt = idt
+                    source_str = 'Except_S' + str(idt)
+                    target_str = 'S' + str(idt)
+                    args.task_str = source_str + '_2_' + target_str
+                    
+                    args.log = my_log # 修复属性缺失
+                    
+                    # print(f"  Run: {data_name} | Seed {s} | Sub {idt} ...", end='\r')
+                    sub_acc_all[idt] = train_target(args)
+                
+                # print(f"  Run: {data_name} | Seed {s} | Done. Avg: {np.mean(sub_acc_all):.2f}%")
 
-        # temperature rescaling, for test entropy calculation
-        t = 2
-
-        # whether to test balanced or imbalanced (2:1) target subject
-        balanced = True
-
-        # whether to record running time
-        calc_time = False
-        
-        # MSR参数
-        msr_noise_intensity = 0.1  # !! 关键调优参数 !!
-        msr_a = 1.0
-        msr_b = 1.0
-
-        args = argparse.Namespace(feature_deep_dim=feature_deep_dim, align=align, lr=lr, t=t, max_epoch=max_epoch,
-                                  trial_num=trial_num, time_sample_num=time_sample_num, sample_rate=sample_rate,
-                                  N=N, chn=chn, class_num=class_num, stride=stride, steps=steps, calc_time=calc_time,
-                                  paradigm=paradigm, test_batch=test_batch, data_name=data_name, balanced=balanced,
-                                  msr_noise_intensity=msr_noise_intensity,
-                                  msr_a=msr_a,
-                                  msr_b=msr_b)
-
-        args.method = 'T-TIME'
-        args.backbone = 'EEGNet'
-
-        # train batch size
-        args.batch_size = 32
-
-        # GPU device id
-        try:
-            device_id = str(sys.argv[1])
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            args.data_env = 'gpu' if torch.cuda.device_count() != 0 else 'local'
-        except:
-            args.data_env = 'local'
-        total_acc = []
-
-        # update multiple models, independently, from the source models
-        for s in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
-            args.SEED = s
-
-            fix_random_seed(args.SEED)
-            torch.backends.cudnn.deterministic = True
-
-            args.data = data_name
-            print(args.data)
-            print(args.method)
-            print(args.SEED)
-            print(args)
-
-            args.local_dir = './data/' + str(data_name) + '/'
-            args.result_dir = './logs/'
-            my_log = LogRecord(args)
-            my_log.log_init()
-            my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
-
-            sub_acc_all = np.zeros(N)
-            for idt in range(N):
-                args.idt = idt
-                source_str = 'Except_S' + str(idt)
-                target_str = 'S' + str(idt)
-                args.task_str = source_str + '_2_' + target_str
-                info_str = '\n========================== Transfer to ' + target_str + ' =========================='
-                print(info_str)
-                my_log.record(info_str)
-                args.log = my_log
-
-                sub_acc_all[idt] = train_target(args)
-            print('Sub acc: ', np.round(sub_acc_all, 3))
-            print('Avg acc: ', np.round(np.mean(sub_acc_all), 3))
-            total_acc.append(sub_acc_all)
-
-            acc_sub_str = str(np.round(sub_acc_all, 3).tolist())
-            acc_mean_str = str(np.round(np.mean(sub_acc_all), 3).tolist())
-            args.log.record("\n==========================================")
-            args.log.record(acc_sub_str)
-            args.log.record(acc_mean_str)
-
-        args.log.record('\n' + '#' * 20 + 'final results' + '#' * 20)
-
-        print(str(total_acc))
-
-        args.log.record(str(total_acc))
-
-        subject_mean = np.round(np.average(total_acc, axis=0), 5)
-        total_mean = np.round(np.average(np.average(total_acc)), 5)
-        total_std = np.round(np.std(np.average(total_acc, axis=1)), 5)
-
-        print(subject_mean)
-        print(total_mean)
-        print(total_std)
-
-        args.log.record(str(subject_mean))
-        args.log.record(str(total_mean))
-        args.log.record(str(total_std))
-
-        result_dct = {'dataset': data_name, 'avg': total_mean, 'std': total_std}
-        for i in range(len(subject_mean)):
-            result_dct['s' + str(i)] = subject_mean[i]
-
-        new_row = pd.DataFrame([result_dct])
-        dct = pd.concat([dct, new_row], ignore_index=True)    
-
-    # save results to csv
-    dct.to_csv('./logs/' + str(args.method) + ".csv")
+    print(f"\nAll experiments finished in {(time.time() - total_start_time)/60:.1f} minutes.")
+    print("Now please run: python ./tl/msr_ensemble.py")

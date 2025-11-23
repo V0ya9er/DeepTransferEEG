@@ -148,3 +148,5 @@ feature_ssda.py
 .DS__Store
 .DS_Store
 *.ckpt
+*.ckpt
+/runs
